@@ -1,0 +1,31 @@
+# Binaries
+/telegrim
+/cmd/telegrim/telegrim
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test
+*.test
+*.out
+coverage.*
+
+# TDLib/gotd session data
+tdlib/
+*.session
+*.session-journal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+.env.local
