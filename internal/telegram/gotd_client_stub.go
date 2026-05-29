@@ -528,12 +528,7 @@ func (g *GotdClient) Close() error {
 	g.auth = nil
 	g.authMu.Unlock()
 
-	g.connMu.Lock()
-	if g.connStop != nil {
-		g.connStop()
-		g.connStop = nil
-	}
-	g.connMu.Unlock()
+	g.resetConn()
 	return nil
 }
 
@@ -636,6 +631,11 @@ func (g *GotdClient) ensureConn(waitCtx context.Context) error {
 
 func (g *GotdClient) withClient(ctx context.Context, fn func(context.Context, *gtg.Client) error) error {
 	if err := g.ensureConn(ctx); err != nil {
+		if strings.Contains(err.Error(), "AUTH_KEY_UNREGISTERED") {
+			g.resetConn()
+			_ = os.Remove(g.sessionFile)
+			return fmt.Errorf("session abgelaufen — bitte neu einloggen")
+		}
 		return err
 	}
 	g.connMu.Lock()
@@ -647,18 +647,18 @@ func (g *GotdClient) withClient(ctx context.Context, fn func(context.Context, *g
 	}
 	err := fn(connCtx, api)
 	if err != nil {
-		// Bei FLOOD_WAIT die angegebene Wartezeit einhalten und einmal wiederholen.
-		var wait int
-		if _, scanErr := fmt.Sscanf(err.Error(), "dialogs laden fehlgeschlagen: rpcDoRequest: rpc error code 420: FLOOD_WAIT (%d)", &wait); scanErr != nil {
-			fmt.Sscanf(err.Error(), "rpcDoRequest: rpc error code 420: FLOOD_WAIT (%d)", &wait)
+		if strings.Contains(err.Error(), "AUTH_KEY_UNREGISTERED") {
+			g.resetConn()
+			_ = os.Remove(g.sessionFile)
+			return fmt.Errorf("session abgelaufen — bitte neu einloggen")
 		}
-		if wait <= 0 {
-			// generischer FLOOD_WAIT ohne Parse-Erfolg
-			if strings.Contains(err.Error(), "FLOOD_WAIT") {
+		// Bei FLOOD_WAIT die angegebene Wartezeit einhalten und einmal wiederholen.
+		if strings.Contains(err.Error(), "FLOOD_WAIT") {
+			var wait int
+			fmt.Sscanf(err.Error(), "%*[^(](%d)", &wait)
+			if wait <= 0 {
 				wait = 5
 			}
-		}
-		if wait > 0 {
 			select {
 			case <-time.After(time.Duration(wait+1) * time.Second):
 			case <-ctx.Done():
@@ -668,6 +668,21 @@ func (g *GotdClient) withClient(ctx context.Context, fn func(context.Context, *g
 		}
 	}
 	return err
+}
+
+// resetConn stoppt die persistente Verbindung und setzt den Zustand zurück,
+// damit ensureConn beim nächsten Aufruf neu verbindet.
+func (g *GotdClient) resetConn() {
+	g.connMu.Lock()
+	if g.connStop != nil {
+		g.connStop()
+		g.connStop = nil
+	}
+	g.connAPI = nil
+	g.connCtx = nil
+	g.connReady = nil
+	g.connErr = nil
+	g.connMu.Unlock()
 }
 
 func (g *GotdClient) credentials() (int, string, error) {
