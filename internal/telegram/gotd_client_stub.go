@@ -42,7 +42,8 @@ type GotdClient struct {
 	connAPI   *gtg.Client    // gesetzt innerhalb Run(), nil wenn getrennt
 	connCtx   context.Context
 	connStop  context.CancelFunc
-	connReady chan struct{} // closed sobald connAPI gesetzt ist
+	connReady chan struct{} // closed sobald connAPI gesetzt ist oder Run() fehlschlägt
+	connErr   error        // gesetzt wenn Run() ohne Callback-Aufruf fehlschlägt
 }
 
 // gotdAuth implementiert auth.UserAuthenticator über Channels. Phone wird
@@ -538,8 +539,8 @@ func (g *GotdClient) Close() error {
 
 // ensureConn stellt sicher dass eine persistente Verbindung zu Telegram läuft.
 // Beim ersten Aufruf wird der Client gestartet; danach wird die bestehende
-// Verbindung wiederverwendet. Falls die Verbindung abgebrochen ist, wird sie
-// neu aufgebaut.
+// Verbindung wiederverwendet. Falls Run() vor dem Callback fehlschlägt, wird
+// readyCh trotzdem geschlossen und connErr gesetzt.
 func (g *GotdClient) ensureConn(waitCtx context.Context) error {
 	g.connMu.Lock()
 	if g.connReady != nil {
@@ -547,6 +548,13 @@ func (g *GotdClient) ensureConn(waitCtx context.Context) error {
 		g.connMu.Unlock()
 		select {
 		case <-ready:
+			g.connMu.Lock()
+			err := g.connErr
+			api := g.connAPI
+			g.connMu.Unlock()
+			if api == nil && err != nil {
+				return err
+			}
 			return nil
 		case <-waitCtx.Done():
 			return waitCtx.Err()
@@ -566,6 +574,7 @@ func (g *GotdClient) ensureConn(waitCtx context.Context) error {
 	_ = rand.Reader
 	readyCh := make(chan struct{})
 	g.connReady = readyCh
+	g.connErr = nil
 	connCtx, stop := context.WithCancel(context.Background())
 	g.connStop = stop
 	sessionFile := g.sessionFile
@@ -576,7 +585,9 @@ func (g *GotdClient) ensureConn(waitCtx context.Context) error {
 	})
 
 	go func() {
-		_ = client.Run(connCtx, func(ctx context.Context) error {
+		callbackCalled := false
+		runErr := client.Run(connCtx, func(ctx context.Context) error {
+			callbackCalled = true
 			g.connMu.Lock()
 			g.connAPI = client
 			g.connCtx = ctx
@@ -585,18 +596,39 @@ func (g *GotdClient) ensureConn(waitCtx context.Context) error {
 			<-ctx.Done()
 			return nil
 		})
-		// Verbindung beendet — zurücksetzen damit nächster withClient-Aufruf
-		// eine neue Verbindung aufbaut.
+		// Verbindung beendet.
 		g.connMu.Lock()
 		g.connAPI = nil
 		g.connCtx = nil
 		g.connReady = nil
+		if !callbackCalled {
+			// Run() schlug fehl bevor der Callback aufgerufen wurde →
+			// readyCh schließen damit wartende Goroutinen nicht ewig blockieren.
+			g.connErr = runErr
+			select {
+			case <-readyCh:
+			default:
+				close(readyCh)
+			}
+		}
 		g.connMu.Unlock()
 	}()
 
+	// Max 15s auf Verbindungsaufbau warten.
+	timeout := time.NewTimer(15 * time.Second)
+	defer timeout.Stop()
 	select {
 	case <-readyCh:
+		g.connMu.Lock()
+		err := g.connErr
+		api := g.connAPI
+		g.connMu.Unlock()
+		if api == nil && err != nil {
+			return err
+		}
 		return nil
+	case <-timeout.C:
+		return fmt.Errorf("verbindungsaufbau zu Telegram timeout (15s)")
 	case <-waitCtx.Done():
 		return waitCtx.Err()
 	}
