@@ -613,7 +613,29 @@ func (g *GotdClient) withClient(ctx context.Context, fn func(context.Context, *g
 	if api == nil {
 		return fmt.Errorf("keine Verbindung zu Telegram")
 	}
-	return fn(connCtx, api)
+	err := fn(connCtx, api)
+	if err != nil {
+		// Bei FLOOD_WAIT die angegebene Wartezeit einhalten und einmal wiederholen.
+		var wait int
+		if _, scanErr := fmt.Sscanf(err.Error(), "dialogs laden fehlgeschlagen: rpcDoRequest: rpc error code 420: FLOOD_WAIT (%d)", &wait); scanErr != nil {
+			fmt.Sscanf(err.Error(), "rpcDoRequest: rpc error code 420: FLOOD_WAIT (%d)", &wait)
+		}
+		if wait <= 0 {
+			// generischer FLOOD_WAIT ohne Parse-Erfolg
+			if strings.Contains(err.Error(), "FLOOD_WAIT") {
+				wait = 5
+			}
+		}
+		if wait > 0 {
+			select {
+			case <-time.After(time.Duration(wait+1) * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return fn(connCtx, api)
+		}
+	}
+	return err
 }
 
 func (g *GotdClient) credentials() (int, string, error) {

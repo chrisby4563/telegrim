@@ -228,9 +228,8 @@ func (m Model) Init() tea.Cmd {
 }
 
 // refreshInterval steuert wie oft Chat-Liste + aktueller Chat automatisch neu
-// gezogen werden, damit eingehende Messages live erscheinen. 2s ist ein guter
-// Kompromiss zwischen Reaktivität und Backend-Last.
-const refreshInterval = 2 * time.Second
+// gezogen werden. 8s ist der Kompromiss damit Telegram kein FLOOD_WAIT schickt.
+const refreshInterval = 8 * time.Second
 
 type refreshTickMsg time.Time
 
