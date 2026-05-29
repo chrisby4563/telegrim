@@ -21,8 +21,8 @@ import (
 // GotdClient ist ein produktiv testbarer Telegram-Client auf Basis von gotd/td.
 // Auth-Phase nutzt einen persistenten Run mit channel-basiertem
 // UserAuthenticator → Login = SendCode (SMS), LoginWithCode = SignIn (+ 2FA).
-// Nach erfolgreichem Auth wird das Auth-Goroutine beendet, Session liegt auf
-// Disk; Operationen laufen per kurzem withClient-Pattern.
+// Nach erfolgreichem Auth bleibt eine persistente Verbindung offen; alle
+// API-Calls teilen sich diese eine TCP-Verbindung (connMu-geschützt).
 type GotdClient struct {
 	mu sync.RWMutex
 
@@ -36,6 +36,13 @@ type GotdClient struct {
 	authDoneCh chan error // 1-Slot; gepostet wenn IfNecessary returnt
 
 	peerCache map[int64]tg.InputPeerClass
+
+	// Persistente Verbindung — einmal gestartet, für alle API-Calls geteilt.
+	connMu    sync.Mutex
+	connAPI   *gtg.Client    // gesetzt innerhalb Run(), nil wenn getrennt
+	connCtx   context.Context
+	connStop  context.CancelFunc
+	connReady chan struct{} // closed sobald connAPI gesetzt ist
 }
 
 // gotdAuth implementiert auth.UserAuthenticator über Channels. Phone wird
@@ -98,8 +105,7 @@ func NewGotdClient(apiID int, apiHash string, sessionFile string) *GotdClient {
 }
 
 func (g *GotdClient) Connect(ctx context.Context) error {
-	// Kein dauerhafter Socket nötig, da die Calls jeweils mit eigener Run-Session laufen.
-	return nil
+	return g.ensureConn(ctx)
 }
 
 // Login speichert API-Credentials. Wenn auch eine Telefonnummer dabei ist,
@@ -520,26 +526,94 @@ func (g *GotdClient) Close() error {
 	}
 	g.auth = nil
 	g.authMu.Unlock()
+
+	g.connMu.Lock()
+	if g.connStop != nil {
+		g.connStop()
+		g.connStop = nil
+	}
+	g.connMu.Unlock()
 	return nil
 }
 
-func (g *GotdClient) withClient(ctx context.Context, fn func(context.Context, *gtg.Client) error) error {
+// ensureConn stellt sicher dass eine persistente Verbindung zu Telegram läuft.
+// Beim ersten Aufruf wird der Client gestartet; danach wird die bestehende
+// Verbindung wiederverwendet. Falls die Verbindung abgebrochen ist, wird sie
+// neu aufgebaut.
+func (g *GotdClient) ensureConn(waitCtx context.Context) error {
+	g.connMu.Lock()
+	if g.connReady != nil {
+		ready := g.connReady
+		g.connMu.Unlock()
+		select {
+		case <-ready:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	}
+
 	appID, appHash, err := g.credentials()
 	if err != nil {
+		g.connMu.Unlock()
 		return err
 	}
 	if err := g.ensureSessionDir(); err != nil {
+		g.connMu.Unlock()
 		return err
 	}
 
-	_ = rand.Reader // Keep crypto/rand linked for future extensions.
+	_ = rand.Reader
+	readyCh := make(chan struct{})
+	g.connReady = readyCh
+	connCtx, stop := context.WithCancel(context.Background())
+	g.connStop = stop
+	sessionFile := g.sessionFile
+	g.connMu.Unlock()
+
 	client := gtg.NewClient(appID, appHash, gtg.Options{
-		SessionStorage: &session.FileStorage{Path: g.sessionFile},
+		SessionStorage: &session.FileStorage{Path: sessionFile},
 	})
 
-	return client.Run(ctx, func(ctx context.Context) error {
-		return fn(ctx, client)
-	})
+	go func() {
+		_ = client.Run(connCtx, func(ctx context.Context) error {
+			g.connMu.Lock()
+			g.connAPI = client
+			g.connCtx = ctx
+			g.connMu.Unlock()
+			close(readyCh)
+			<-ctx.Done()
+			return nil
+		})
+		// Verbindung beendet — zurücksetzen damit nächster withClient-Aufruf
+		// eine neue Verbindung aufbaut.
+		g.connMu.Lock()
+		g.connAPI = nil
+		g.connCtx = nil
+		g.connReady = nil
+		g.connMu.Unlock()
+	}()
+
+	select {
+	case <-readyCh:
+		return nil
+	case <-waitCtx.Done():
+		return waitCtx.Err()
+	}
+}
+
+func (g *GotdClient) withClient(ctx context.Context, fn func(context.Context, *gtg.Client) error) error {
+	if err := g.ensureConn(ctx); err != nil {
+		return err
+	}
+	g.connMu.Lock()
+	api := g.connAPI
+	connCtx := g.connCtx
+	g.connMu.Unlock()
+	if api == nil {
+		return fmt.Errorf("keine Verbindung zu Telegram")
+	}
+	return fn(connCtx, api)
 }
 
 func (g *GotdClient) credentials() (int, string, error) {
